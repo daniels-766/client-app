@@ -30,22 +30,30 @@ def get_local_ip():
 def receive_info():
     data = request.json or {}
 
-    # SELALU forward ke Linux jika payload batch (user+data) dan belum diforward
-    if data.get("user") and data.get("data") and not data.get("server_forwarded"):
-        try:
+    # HANYA forward jika payload batch dari dashboard (punya kredensial) dan belum diforward
+    try:
+        user = data.get("user") or {}
+        has_creds = bool(user.get("num_sip")) and bool(user.get("pas_sip"))
+        is_batch = has_creds and isinstance(data.get("data"), list) and len(data["data"]) > 0
+        already_forwarded = bool(data.get("server_forwarded"))
+
+        if is_batch and not already_forwarded:
             fwd = dict(data)
             fwd["server_forwarded"] = True
             res = requests.post(f"{LINUX_SERVER}/push-data", json=fwd, timeout=10)
-            # log sukses/gagal supaya kelihatan jelas di Monitoring Log
             msg = f"[FORWARD] /push-data -> {res.status_code} {res.text[:200]}\n"
-        except Exception as e:
-            msg = f"[FORWARD ERROR] {e}\n"
+            if client_ui:
+                client_ui.log_area.insert("end", msg)
+                client_ui.log_area.see("end")
+    except Exception as e:
         if client_ui:
-            client_ui.log_area.insert("end", msg)
+            client_ui.log_area.insert("end", f"[FORWARD ERROR] {e}\n")
             client_ui.log_area.see("end")
 
+    # Tampilkan event/progress apapun ke UI
     if client_ui:
         client_ui.show_data(data)
+
     return jsonify({"status": "ok", "message": "Data diterima client"}), 200
 
 def run_flask():
@@ -239,7 +247,6 @@ class ClientUI:
                                 self.log_area.insert("end", f"[ACTION] {act.get('action')} -> {act.get('message')}\n")
                                 self.log_area.see("end")
                             elif etype == "dataset":
-                                # optional: tampilkan info dataset masuk
                                 self.log_area.insert("end", "[INFO] Dataset diterima server.\n")
                                 self.log_area.see("end")
                         since = max(since, max(ev["event_id"] for ev in evs))

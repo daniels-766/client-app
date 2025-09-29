@@ -19,13 +19,13 @@ CLIENT_PORT_DEFAULT = 6000
 SIP_DOMAIN = "ld.infin8link.com"
 SIP_HOSTPORT = "ld.infin8link.com:7060"
 SIP_REG_URI = f"sip:{SIP_HOSTPORT}"
-SIP_DIAL_SUFFIX = f"@{SIP_HOSTPORT}"   # hasil: sip:<number>@ld.infin8link.com:7060
+SIP_DIAL_SUFFIX = f"@{SIP_HOSTPORT}"   # sip:<number>@ld.infin8link.com:7060
 # ===========================================================
 
 app = Flask(__name__)
 
 # ======= State global =======
-connected_clients = set()    # misal: "http://192.168.88.201:6000"
+connected_clients = set()    # contoh: "http://192.168.88.201:6000"
 call_queue = Queue()
 state_lock = threading.Lock()
 
@@ -41,6 +41,7 @@ call_status = {
 
 pause_event = threading.Event()  # set() -> jalan; clear() -> pause
 stop_event  = threading.Event()  # set() -> stop
+run_event   = threading.Event()  # set() saat /api/call -> worker boleh eksekusi
 
 # ======= Event Bus (untuk realtime polling dari Windows) =======
 EVENT_MAX = 2000
@@ -171,7 +172,7 @@ class SipManager:
             cfg.reg_uri = SIP_REG_URI
             # Penting: gunakan argumen POSISI (realm, username, passwd)
             cfg.auth_cred = [pj.AuthCred("*", username, password)]
-            # Jika perlu paksa UDP (uncomment baris berikut):
+            # Paksa UDP? (jika perlu)
             # cfg.proxy = [f"sip:{SIP_HOSTPORT};transport=udp"]
 
             self.acc = self.lib.create_account(cfg)
@@ -192,6 +193,8 @@ class SipManager:
         """
         1) Dial ke target_number
         2) Jika terjawab dan agent_user diberikan -> REFER (transfer) ke agent_user@host:port
+           - gunakan call.xfer() jika tersedia;
+           - fallback: REFER manual via call.send_request("REFER").
         3) Hangup leg dialer (media berjalan antara agent<->nasabah via SIP server)
         """
         # pastikan thread ini terdaftar di PJLIB
@@ -222,8 +225,19 @@ class SipManager:
         if answered and agent_user:
             try:
                 refer_to = f"sip:{agent_user}@{SIP_HOSTPORT}"
-                call.xfer(refer_to)  # unattended transfer (SIP REFER)
-                detail = f"transferred_to:{agent_user}"
+                if hasattr(call, "xfer") and callable(getattr(call, "xfer")):
+                    call.xfer(refer_to)  # API modern
+                    detail = f"transferred_to:{agent_user}"
+                else:
+                    # REFER manual
+                    hdrs = [
+                        pj.Header(name="Refer-To", value=f"<{refer_to}>"),
+                        pj.Header(name="Referred-By", value=f"<sip:{self.acc_user}@{SIP_HOSTPORT}>")
+                    ]
+                    # Signature umum: send_request(method, hdr_list=None, content_type=None, body=None)
+                    call.send_request("REFER", hdr_list=hdrs)
+                    time.sleep(0.8)  # beri waktu PBX proses REFER
+                    detail = f"transferred_to:{agent_user} (manual REFER)"
             except Exception as e:
                 detail = f"transfer_error:{e}"
         elif answered and not agent_user:
@@ -277,6 +291,17 @@ def call_flow_worker():
                 "total_tagihan": item.get("total_tagihan"),
             }
             call_status["active_sip_user"] = username
+
+        # === Gate: tunggu user klik "Call" ===
+        while not run_event.is_set():
+            if stop_event.is_set():
+                break
+            time.sleep(0.2)
+        if stop_event.is_set():
+            call_queue.task_done()
+            with state_lock:
+                call_status["in_progress"] = None
+            continue
 
         # Pause/Stop handling
         while not pause_event.is_set():
@@ -349,9 +374,10 @@ def call_flow_worker():
             call_status["in_progress"] = None
         call_queue.task_done()
 
-# Jalankan worker
+# Inisialisasi flags & jalankan worker
 pause_event.set()
 stop_event.clear()
+run_event.clear()     # default: belum boleh jalan sampai klik "Call"
 worker_thread = threading.Thread(target=call_flow_worker, daemon=True)
 worker_thread.start()
 
@@ -408,6 +434,7 @@ def handle_action(action):
             call_status["running"] = True
             call_status["paused"] = False
             call_status["stopped"] = False
+        run_event.set()        # mulai eksekusi
         pause_event.set()
         stop_event.clear()
         msg = "Call dimulai (worker aktif)"
@@ -432,12 +459,10 @@ def handle_action(action):
 
     elif action == "stop":
         with state_lock:
-            if call_status["running"]:
-                call_status["running"] = False
-                call_status["paused"] = False
-                call_status["stopped"] = True
-            else:
-                call_status["stopped"] = True
+            call_status["running"] = False
+            call_status["paused"] = False
+            call_status["stopped"] = True
+        run_event.clear()      # hentikan eksekusi
         stop_event.set()
         pause_event.set()
 
