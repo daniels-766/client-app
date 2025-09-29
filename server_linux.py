@@ -3,7 +3,7 @@ import threading
 import time
 from queue import Queue
 from collections import deque
-from flask import Flask, request, jsonify, request as flask_request
+from flask import Flask, jsonify, request as flask_request
 import requests
 
 # ==== PJSIP (pjsua) ====
@@ -15,16 +15,17 @@ RING_TIMEOUT_SEC = 45
 RETRY_GAP_SEC = 4
 CLIENT_PORT_DEFAULT = 6000
 
+# SIP server kamu (ganti jika perlu)
 SIP_DOMAIN = "ld.infin8link.com"
 SIP_HOSTPORT = "ld.infin8link.com:7060"
 SIP_REG_URI = f"sip:{SIP_HOSTPORT}"
-SIP_DIAL_SUFFIX = f"@{SIP_HOSTPORT}"   # sip:<number>@ld.infin8link.com:7060
+SIP_DIAL_SUFFIX = f"@{SIP_HOSTPORT}"   # hasil: sip:<number>@ld.infin8link.com:7060
 # ===========================================================
 
 app = Flask(__name__)
 
 # ======= State global =======
-connected_clients = set()    # contoh: "http://192.168.88.201:6000"
+connected_clients = set()    # misal: "http://192.168.88.201:6000"
 call_queue = Queue()
 state_lock = threading.Lock()
 
@@ -47,8 +48,22 @@ events_buf = deque(maxlen=EVENT_MAX)  # simpan dict event
 event_lock = threading.Lock()
 event_seq = 0
 
+def broadcast_to_clients(path, payload):
+    dead = []
+    for base in list(connected_clients):
+        url = f"{base}{path}"
+        try:
+            requests.post(url, json=payload, timeout=2.5)
+        except Exception:
+            dead.append(base)
+    for d in dead:
+        connected_clients.discard(d)
+
 def publish_event(ev: dict, also_broadcast=True):
-    """Simpan event ke buffer + optional broadcast ke Windows."""
+    """
+    Simpan event ke buffer + optional broadcast ke Windows.
+    ev: { "type": "...", "payload": {...} }
+    """
     global event_seq
     with event_lock:
         event_seq += 1
@@ -63,6 +78,18 @@ def publish_event(ev: dict, also_broadcast=True):
             pass
     return ev_out
 
+def make_progress_payload(item, phase, number, answered, detail):
+    return {
+        "user": {"id_system": "-", "username": "worker", "phone": "-"},
+        "data": [item],
+        "progress": {
+            "phase": phase,
+            "number": number,
+            "answered": answered,  # None saat "CALLING ..."
+            "detail": detail
+        }
+    }
+
 # ===========================================================
 #                 PJSIP: Library & Account
 # ===========================================================
@@ -70,6 +97,14 @@ def _log_cb(level, s, length):
     try:
         print(s.strip())
     except Exception:
+        pass
+
+def _register_pj_thread(name="worker"):
+    """Wajib dipanggil di setiap thread non-utama yang menyentuh PJLIB/PJSUA."""
+    try:
+        pj.Lib.instance().thread_register(name)
+    except Exception:
+        # jika sudah terdaftar / race, aman diabaikan
         pass
 
 class _CallCb(pj.CallCallback):
@@ -124,6 +159,9 @@ class SipManager:
             self.acc_pass = None
 
     def ensure_account(self, username: str, password: str):
+        # pastikan thread ini sudah terdaftar di PJLIB (aman dipanggil berulang)
+        _register_pj_thread("ensure-account")
+
         with self.lock:
             if self.acc and self.acc_user == username and self.acc_pass == password:
                 return
@@ -131,16 +169,20 @@ class SipManager:
             cfg = pj.AccountConfig()
             cfg.id = f"sip:{username}@{SIP_DOMAIN}"
             cfg.reg_uri = SIP_REG_URI
+            # Penting: gunakan argumen POSISI (realm, username, passwd)
             cfg.auth_cred = [pj.AuthCred("*", username, password)]
-            # Paksa UDP? uncomment:
+            # Jika perlu paksa UDP (uncomment baris berikut):
             # cfg.proxy = [f"sip:{SIP_HOSTPORT};transport=udp"]
+
             self.acc = self.lib.create_account(cfg)
             self.acc_user = username
             self.acc_pass = password
+
             # Tunggu register (maks 5 detik)
             t0 = time.time()
             while time.time() - t0 < 5:
-                if self.acc.info().reg_status == 200:
+                info = self.acc.info()
+                if info.reg_status == 200:
                     print(f"[PJSIP] Registered as {username}")
                     return
                 time.sleep(0.2)
@@ -152,6 +194,9 @@ class SipManager:
         2) Jika terjawab dan agent_user diberikan -> REFER (transfer) ke agent_user@host:port
         3) Hangup leg dialer (media berjalan antara agent<->nasabah via SIP server)
         """
+        # pastikan thread ini terdaftar di PJLIB
+        _register_pj_thread("dial-transfer")
+
         if not self.acc:
             return {"answered": False, "detail": "no_account"}
 
@@ -207,35 +252,12 @@ class SipManager:
 sip = SipManager()
 
 # ===========================================================
-#            Broadcast util + helper format event
-# ===========================================================
-def broadcast_to_clients(path, payload):
-    dead = []
-    for base in list(connected_clients):
-        url = f"{base}{path}"
-        try:
-            requests.post(url, json=payload, timeout=2.5)
-        except Exception:
-            dead.append(base)
-    for d in dead:
-        connected_clients.discard(d)
-
-def make_progress_payload(item, phase, number, answered, detail):
-    return {
-        "user": {"id_system": "-", "username": "worker", "phone": "-"},
-        "data": [item],
-        "progress": {
-            "phase": phase,
-            "number": number,
-            "answered": answered,
-            "detail": detail
-        }
-    }
-
-# ===========================================================
 #                     Worker antrian
 # ===========================================================
 def call_flow_worker():
+    # Daftarkan thread worker ke PJLIB
+    _register_pj_thread("call-worker")
+
     while True:
         item = call_queue.get()
         if item is None:
@@ -362,8 +384,8 @@ def push_data():
     if not sip_user or not sip_pass:
         return jsonify({"status": "error", "message": "num_sip/pas_sip kosong"}), 400
 
-    # broadcast tabel awal (opsional)
-    publish_event({"type": "dataset", "payload": payload})  # juga broadcast
+    # event dataset masuk (juga broadcast ke Windows)
+    publish_event({"type": "dataset", "payload": payload})
 
     added = 0
     for row in dataset:
