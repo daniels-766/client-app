@@ -190,7 +190,7 @@ class ClientUI:
 
     # ---------- Tampilkan data + progress ----------
     def show_data(self, data):
-        # Kalau datang batch asli dari dashboard (ada data list & kredensial),
+        # Jika datang batch asli dari dashboard (ada data list & kredensial),
         # simpan ke cache dan refresh UI utama. EVENT progress dari server tidak memodifikasi ini.
         if isinstance(data.get("data"), list) and data.get("data"):
             user = data.get("user") or {}

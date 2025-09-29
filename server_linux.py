@@ -15,11 +15,10 @@ RING_TIMEOUT_SEC = 45
 RETRY_GAP_SEC = 4
 CLIENT_PORT_DEFAULT = 6000
 
-# SIP server kamu (ganti jika perlu)
+# SIP server (sesuaikan dengan punyamu)
 SIP_DOMAIN = "ld.infin8link.com"
-SIP_HOSTPORT = "ld.infin8link.com:6070"
-SIP_REG_URI = f"sip:{SIP_HOSTPORT}"
-SIP_DIAL_SUFFIX = f"@{SIP_HOSTPORT}"   # sip:<number>@ld.infin8link.com:6070
+SIP_HOSTPORT = "ld.infin8link.com:7060"  # port SIP kamu
+SIP_REG_URI = f"sip:{SIP_HOSTPORT}"      # untuk REGISTER
 
 # Waktu tunggu step polling
 DIAL_WAIT_STEP = 0.1
@@ -84,9 +83,9 @@ def publish_event(ev: dict, also_broadcast=True):
 
 def make_progress_payload(item, phase, number, answered, detail):
     return {
-        # NOTE: payload progress TIDAK mengandung kredensial; biar Windows tidak overwrite Staff/Data
+        # NOTE: progress payload TIDAK berisi kredensial user agar client tidak overwrite kartu staff
         "user": {"username": "worker"},
-        "data": [],  # jangan bawa batch agar Windows tidak refresh tabel
+        "data": [],  # jangan kirim batch di progress agar tabel tidak ke-refresh
         "progress": {
             "phase": phase,
             "number": number,
@@ -170,42 +169,30 @@ class SipManager:
         _register_pj_thread("ensure-account")
 
         with self.lock:
-            # reset akun beda kredensial
-            if not (self.acc and self.acc_user == username and self.acc_pass == password):
-                self._destroy_acc()
-                cfg = pj.AccountConfig()
-                cfg.id = f"sip:{username}@{SIP_DOMAIN}"
-                cfg.reg_uri = SIP_REG_URI
-                # POSISIONAL (realm, username, password)
-                cfg.auth_cred = [pj.AuthCred("*", username, password)]
-                # >>> Paksa TRANSPORT UDP (sering wajib)
-                cfg.proxy = [f"sip:{SIP_HOSTPORT};transport=udp"]
-                # <<<
-                self.acc = self.lib.create_account(cfg)
-                self.acc_user = username
-                self.acc_pass = password
+            if self.acc and self.acc_user == username and self.acc_pass == password:
+                return
+            self._destroy_acc()
+            cfg = pj.AccountConfig()
+            cfg.id = f"sip:{username}@{SIP_DOMAIN}"
+            cfg.reg_uri = SIP_REG_URI
+            # Penting: gunakan argumen POSISI (realm, username, passwd)
+            cfg.auth_cred = [pj.AuthCred("*", username, password)]
+            # Paksa route via UDP ke host:port kamu
+            cfg.proxy = [f"sip:{SIP_HOSTPORT};transport=udp"]
 
-        # TUNGGU REGISTER (8 detik) + publish event agar terlihat di Windows
-        t0 = time.time()
-        reg_ok = False
-        last_code = 0
-        while time.time() - t0 < 8.0:
-            info = self.acc.info()
-            last_code = info.reg_status
-            if last_code == 200:
-                reg_ok = True
-                break
-            time.sleep(0.2)
+            self.acc = self.lib.create_account(cfg)
+            self.acc_user = username
+            self.acc_pass = password
 
-        detail = "registered" if reg_ok else f"register_status:{last_code}"
-        publish_event({"type": "progress",
-                       "payload": {
-                           "user": {"username": "worker"},
-                           "data": [],
-                           "progress": {"phase": "REGISTER", "number": "-", "answered": reg_ok, "detail": detail}
-                       }})
-        if not reg_ok:
-            raise RuntimeError(f"register_failed:{last_code}")
+            # Tunggu register (maks 5 detik)
+            t0 = time.time()
+            while time.time() - t0 < 5:
+                info = self.acc.info()
+                if info.reg_status == 200:
+                    print(f"[PJSIP] Registered as {username}")
+                    return
+                time.sleep(0.2)
+            print(f"[PJSIP] Register pending/failed: {self.acc.info().reg_status}")
 
     def _track_call(self, call, add=True):
         with self.active_lock:
@@ -220,7 +207,8 @@ class SipManager:
     def hangup_all(self):
         """Putuskan semua leg aktif segera (untuk STOP total)."""
         try:
-            pj.Lib.instance().hangup_all()
+            if self.lib:
+                self.lib.hangup_all()
         except Exception:
             pass
         with self.active_lock:
@@ -235,8 +223,8 @@ class SipManager:
     def bridge_agent_with_peer(self, agent_user: str, peer_number: str, ring_timeout_sec: int):
         """
         3PCC:
-          1) Panggil Agent (sip:<agent_user>@HOSTPORT) -> tunggu jawab
-          2) Panggil Peer (sip:<peer_number>@HOSTPORT) -> tunggu jawab
+          1) Panggil Agent (sip:<agent_user>@HOSTPORT;transport=udp) -> tunggu jawab
+          2) Panggil Peer (sip:<peer_number>@HOSTPORT;transport=udp) -> tunggu jawab
           3) Hubungkan conf_slot keduanya (dua arah)
         Hormati stop_event: jika STOP, hangup semua dan return aborted.
         """
@@ -245,7 +233,7 @@ class SipManager:
             return {"ok": False, "reason": "no_account"}
 
         # --- 1) Call agent ---
-        agent_uri = f"sip:{agent_user}{SIP_DIAL_SUFFIX}"
+        agent_uri = f"sip:{agent_user}@{SIP_HOSTPORT};transport=udp"
         a_ans = threading.Event()
         a_disc = threading.Event()
         a_cb = _CallCb(a_ans, a_disc)
@@ -268,8 +256,12 @@ class SipManager:
             except: pass
             return {"ok": False, "reason": "agent_no_answer"}
 
+        publish_event({"type":"progress",
+                       "payload": make_progress_payload({"nama_nasabah":"-"}, "AGENT", agent_user, True, "agent_answered")},
+                      also_broadcast=False)
+
         # --- 2) Call peer (nasabah) ---
-        peer_uri = f"sip:{peer_number}{SIP_DIAL_SUFFIX}"
+        peer_uri = f"sip:{peer_number}@{SIP_HOSTPORT};transport=udp"
         p_ans = threading.Event()
         p_disc = threading.Event()
         p_cb = _CallCb(p_ans, p_disc)
@@ -295,6 +287,10 @@ class SipManager:
             except: pass
             self._track_call(p_call, False)
             return {"ok": False, "reason": "peer_no_answer"}
+
+        publish_event({"type":"progress",
+                       "payload": make_progress_payload({"nama_nasabah":"-"}, "NASABAH-LEG", peer_number, True, "peer_answered")},
+                      also_broadcast=False)
 
         # --- 3) Bridge media dua arah ---
         try:
@@ -359,11 +355,7 @@ def call_flow_worker():
                 call_status["in_progress"] = None
             continue
 
-        # LOGIN (event)
-        publish_event({"type": "progress",
-                       "payload": make_progress_payload(item, "LOGIN", "-", None, "authenticating")})
-
-        # Login SIP (REGISTER)
+        # Login SIP
         try:
             sip.ensure_account(username, password)
         except Exception as e:
@@ -392,8 +384,7 @@ def call_flow_worker():
                                                 ring_timeout_sec=RING_TIMEOUT_SEC)
             answered = result.get("ok", False)
             detail = result.get("reason", "")
-            publish_event({"type": "progress",
-                           "payload": make_progress_payload(item, label, number, answered, detail)})
+            publish_event({"type": "progress", "payload": make_progress_payload(item, label, number, answered, detail)})
 
             # Jika bridged berhasil, akhiri proses item ini (agent ngobrol dengan nasabah)
             if answered:
@@ -439,7 +430,7 @@ def single_leg_call(number: str):
     if not sip.acc:
         return {"answered": False, "detail": "no_account"}
 
-    uri = f"sip:{number}{SIP_DIAL_SUFFIX}"
+    uri = f"sip:{number}@{SIP_HOSTPORT};transport=udp"
     ans = threading.Event()
     disc = threading.Event()
     cb = _CallCb(ans, disc)
@@ -564,8 +555,11 @@ def handle_action(action):
 
         # Putuskan SEMUA panggilan aktif & kosongkan antrian di thread terpisah
         def _hard_stop():
-            # FIX: register PJ thread sebelum pakai fungsi PJSIP
-            _register_pj_thread("hard-stop")
+            # >>> WAJIB: register thread ke PJLIB supaya tidak crash
+            try:
+                pj.Lib.instance().thread_register("hard-stop")
+            except Exception:
+                pass
             try:
                 sip.hangup_all()
             except Exception:
@@ -578,10 +572,11 @@ def handle_action(action):
                     drained += 1
             except Exception:
                 pass
-            publish_event({"type": "action",
-                           "payload": {"action": "stop-drain",
-                                       "message": f"Queue drained {drained} items"}},
-                          also_broadcast=False)
+            publish_event(
+                {"type": "action",
+                 "payload": {"action": "stop-drain", "message": f"Queue drained {drained} items"}},
+                 also_broadcast=False
+            )
 
         threading.Thread(target=_hard_stop, daemon=True).start()
         msg = "Call dihentikan (stop signal dikirim, queue dikosongkan di background)"
@@ -623,8 +618,6 @@ if __name__ == "__main__":
         app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
     finally:
         try:
-            # Tidak mematikan Flask; hanya bersihkan PJSIP saat proses keluar
-            if pj.Lib.instance() is not None:
-                pj.Lib.instance().destroy()
+            sip.destroy()
         except Exception:
             pass
