@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import threading
 import time
-from queue import Queue
+from queue import Queue, Empty
 from collections import deque
 from flask import Flask, jsonify, request as flask_request
 import requests
@@ -20,6 +20,9 @@ SIP_DOMAIN = "ld.infin8link.com"
 SIP_HOSTPORT = "ld.infin8link.com:7060"
 SIP_REG_URI = f"sip:{SIP_HOSTPORT}"
 SIP_DIAL_SUFFIX = f"@{SIP_HOSTPORT}"   # sip:<number>@ld.infin8link.com:7060
+
+# Waktu tunggu antar langkah bridge (detik)
+DIAL_WAIT_STEP = 0.1
 # ===========================================================
 
 app = Flask(__name__)
@@ -40,8 +43,8 @@ call_status = {
 }
 
 pause_event = threading.Event()  # set() -> jalan; clear() -> pause
-stop_event  = threading.Event()  # set() -> stop
-run_event   = threading.Event()  # set() saat /api/call -> worker boleh eksekusi
+stop_event  = threading.Event()  # set() -> stop (abort aktif)
+run_event   = threading.Event()  # set() -> worker boleh eksekusi (set saat /api/call)
 
 # ======= Event Bus (untuk realtime polling dari Windows) =======
 EVENT_MAX = 2000
@@ -105,11 +108,10 @@ def _register_pj_thread(name="worker"):
     try:
         pj.Lib.instance().thread_register(name)
     except Exception:
-        # jika sudah terdaftar / race, aman diabaikan
         pass
 
 class _CallCb(pj.CallCallback):
-    """Callback panggilan outgoing; PJSIP akan mengisi self.call."""
+    """Callback untuk setiap panggilan (agent atau nasabah)."""
     def __init__(self, answered_event, disconnected_event):
         super().__init__()
         self.answered_event = answered_event
@@ -137,6 +139,9 @@ class SipManager:
         self.acc_pass = None
         self.lock = threading.Lock()
         self._init_lib()
+        # tracking leg aktif
+        self.active_calls = set()
+        self.active_lock = threading.Lock()
 
     def _init_lib(self):
         self.lib = pj.Lib()
@@ -145,7 +150,7 @@ class SipManager:
         self.lib.create_transport(pj.TransportType.UDP, pj.TransportConfig(0))
         self.lib.create_transport(pj.TransportType.TCP, pj.TransportConfig(0))
         self.lib.start()
-        # Nonaktifkan audio device (server headless)
+        # Nonaktifkan audio device (server headless); media tetap bisa via conference port
         self.lib.set_null_snd_dev()
         print("[PJSIP] Library started (null audio).")
 
@@ -160,7 +165,7 @@ class SipManager:
             self.acc_pass = None
 
     def ensure_account(self, username: str, password: str):
-        # pastikan thread ini sudah terdaftar di PJLIB (aman dipanggil berulang)
+        # pastikan thread ini sudah terdaftar di PJLIB
         _register_pj_thread("ensure-account")
 
         with self.lock:
@@ -172,7 +177,7 @@ class SipManager:
             cfg.reg_uri = SIP_REG_URI
             # Penting: gunakan argumen POSISI (realm, username, passwd)
             cfg.auth_cred = [pj.AuthCred("*", username, password)]
-            # Paksa UDP? (jika perlu)
+            # Jika perlu paksa UDP:
             # cfg.proxy = [f"sip:{SIP_HOSTPORT};transport=udp"]
 
             self.acc = self.lib.create_account(cfg)
@@ -189,79 +194,106 @@ class SipManager:
                 time.sleep(0.2)
             print(f"[PJSIP] Register pending/failed: {self.acc.info().reg_status}")
 
-    def dial_then_transfer_to_agent(self, target_number: str, ring_timeout_sec: int, agent_user: str | None):
-        """
-        1) Dial ke target_number
-        2) Jika terjawab dan agent_user diberikan -> REFER (transfer) ke agent_user@host:port
-           - gunakan call.xfer() jika tersedia;
-           - fallback: REFER manual via call.send_request("REFER").
-        3) Hangup leg dialer (media berjalan antara agent<->nasabah via SIP server)
-        """
-        # pastikan thread ini terdaftar di PJLIB
-        _register_pj_thread("dial-transfer")
+    def _track_call(self, call, add=True):
+        with self.active_lock:
+            if add:
+                self.active_calls.add(call)
+            else:
+                try:
+                    self.active_calls.discard(call)
+                except Exception:
+                    pass
 
-        if not self.acc:
-            return {"answered": False, "detail": "no_account"}
-
-        uri = f"sip:{target_number}{SIP_DIAL_SUFFIX}"
-        answered_evt = threading.Event()
-        disconnected_evt = threading.Event()
-
-        cb = _CallCb(answered_evt, disconnected_evt)
-        call = self.acc.make_call(uri, cb)
-
-        # Tunggu answered atau timeout/disconnect
-        t0 = time.time()
-        answered = False
-        while time.time() - t0 < ring_timeout_sec:
-            if answered_evt.is_set():
-                answered = True
-                break
-            if disconnected_evt.is_set():
-                break
-            time.sleep(0.2)
-
-        detail = "timeout"
-        if answered and agent_user:
-            try:
-                refer_to = f"sip:{agent_user}@{SIP_HOSTPORT}"
-                if hasattr(call, "xfer") and callable(getattr(call, "xfer")):
-                    call.xfer(refer_to)  # API modern
-                    detail = f"transferred_to:{agent_user}"
-                else:
-                    # REFER manual
-                    hdrs = [
-                        pj.Header(name="Refer-To", value=f"<{refer_to}>"),
-                        pj.Header(name="Referred-By", value=f"<sip:{self.acc_user}@{SIP_HOSTPORT}>")
-                    ]
-                    # Signature umum: send_request(method, hdr_list=None, content_type=None, body=None)
-                    call.send_request("REFER", hdr_list=hdrs)
-                    time.sleep(0.8)  # beri waktu PBX proses REFER
-                    detail = f"transferred_to:{agent_user} (manual REFER)"
-            except Exception as e:
-                detail = f"transfer_error:{e}"
-        elif answered and not agent_user:
-            detail = "answered"
-        else:
-            if disconnected_evt.is_set():
-                detail = cb.last_reason or "disconnected"
-
-        # Tutup leg dialer
+    def hangup_all(self):
+        """Putuskan semua leg aktif segera (untuk STOP total)."""
         try:
-            call.hangup()
+            pj.Lib.instance().hangup_all()
         except Exception:
             pass
+        with self.active_lock:
+            for c in list(self.active_calls):
+                try:
+                    c.hangup()
+                except Exception:
+                    pass
+            self.active_calls.clear()
 
-        return {"answered": answered, "detail": detail}
+    # -------------------- 3PCC Bridge --------------------
+    def bridge_agent_with_peer(self, agent_user: str, peer_number: str, ring_timeout_sec: int):
+        """
+        3PCC:
+          1) Panggil Agent (sip:<agent_user>@HOSTPORT) -> tunggu jawab
+          2) Panggil Peer (sip:<peer_number>@HOSTPORT) -> tunggu jawab
+          3) Hubungkan conf_slot keduanya (dua arah)
+        Hormati stop_event: jika STOP, hangup semua dan return aborted.
+        """
+        _register_pj_thread("bridge-3pcc")
+        if not self.acc:
+            return {"ok": False, "reason": "no_account"}
 
-    def destroy(self):
-        self._destroy_acc()
-        if self.lib:
-            try:
-                self.lib.destroy()
-            except Exception:
-                pass
-            self.lib = None
+        # --- 1) Call agent ---
+        agent_uri = f"sip:{agent_user}{SIP_DIAL_SUFFIX}"
+        a_ans = threading.Event()
+        a_disc = threading.Event()
+        a_cb = _CallCb(a_ans, a_disc)
+        a_call = self.acc.make_call(agent_uri, a_cb)
+        self._track_call(a_call, True)
+
+        t0 = time.time()
+        while time.time() - t0 < ring_timeout_sec:
+            if stop_event.is_set():
+                self.hangup_all()
+                return {"ok": False, "reason": "aborted"}
+            if a_ans.is_set():
+                break
+            if a_disc.is_set():
+                return {"ok": False, "reason": "agent_disconnected"}
+            time.sleep(DIAL_WAIT_STEP)
+        if not a_ans.is_set():
+            self._track_call(a_call, False)
+            try: a_call.hangup()
+            except: pass
+            return {"ok": False, "reason": "agent_no_answer"}
+
+        # --- 2) Call peer (nasabah) ---
+        peer_uri = f"sip:{peer_number}{SIP_DIAL_SUFFIX}"
+        p_ans = threading.Event()
+        p_disc = threading.Event()
+        p_cb = _CallCb(p_ans, p_disc)
+        p_call = self.acc.make_call(peer_uri, p_cb)
+        self._track_call(p_call, True)
+
+        t1 = time.time()
+        while time.time() - t1 < ring_timeout_sec:
+            if stop_event.is_set():
+                self.hangup_all()
+                return {"ok": False, "reason": "aborted"}
+            if p_ans.is_set():
+                break
+            if p_disc.is_set():
+                # peer putus sebelum jawab
+                try: p_call.hangup()
+                except: pass
+                self._track_call(p_call, False)
+                return {"ok": False, "reason": "peer_disconnected"}
+            time.sleep(DIAL_WAIT_STEP)
+        if not p_ans.is_set():
+            try: p_call.hangup()
+            except: pass
+            self._track_call(p_call, False)
+            return {"ok": False, "reason": "peer_no_answer"}
+
+        # --- 3) Bridge media dua arah ---
+        try:
+            a_slot = a_call.info().conf_slot
+            p_slot = p_call.info().conf_slot
+            pj.Lib.instance().conf_connect(a_slot, p_slot)
+            pj.Lib.instance().conf_connect(p_slot, a_slot)
+            return {"ok": True, "reason": "bridged", "a_call": a_call, "p_call": p_call}
+        except Exception as e:
+            # gagal bridge → putuskan
+            self.hangup_all()
+            return {"ok": False, "reason": f"bridge_error:{e}"}
 
 sip = SipManager()
 
@@ -269,13 +301,13 @@ sip = SipManager()
 #                     Worker antrian
 # ===========================================================
 def call_flow_worker():
-    # Daftarkan thread worker ke PJLIB
     _register_pj_thread("call-worker")
 
     while True:
-        item = call_queue.get()
-        if item is None:
-            break
+        try:
+            item = call_queue.get(timeout=0.5)
+        except Empty:
+            continue
 
         username = item.get("_sip_user")  # agent SIP (MicroSIP di Windows)
         password = item.get("_sip_pass")
@@ -326,16 +358,41 @@ def call_flow_worker():
             call_queue.task_done()
             continue
 
+        # Urutan panggilan: 3PCC bridge (Agent <-> NASABAH), lalu EC1, EC2 (opsional tanpa bridge)
         numbers = [
             ("NASABAH", item.get("phone")),
             ("EC1", item.get("ec_phone_1")),
             ("EC2", item.get("ec_phone_2")),
         ]
 
-        for label, number in numbers:
+        # NASABAH via BRIDGE ke agent
+        label, number = numbers[0]
+        if number:
+            payload_calling = make_progress_payload(item, f"CALLING {label}", number, None, "ringing")
+            publish_event({"type": "progress", "payload": payload_calling})
+
+            result = sip.bridge_agent_with_peer(agent_user=username, peer_number=number,
+                                                ring_timeout_sec=RING_TIMEOUT_SEC)
+            answered = result.get("ok", False)
+            detail = result.get("reason", "")
+            publish_event({"type": "progress", "payload": make_progress_payload(item, label, number, answered, detail)})
+
+            # Jika bridged berhasil, akhiri proses item ini (agent ngobrol dengan nasabah)
+            if answered:
+                with state_lock:
+                    call_status["processed"] += 1
+                    call_status["in_progress"] = None
+                call_queue.task_done()
+                # tunggu sampai stop atau sampai kedua leg putus? (Tidak perlu; bridge jalan di background)
+                continue
+            else:
+                # jika tidak terjawab atau gagal bridge, lanjut ke EC1/EC2
+                time.sleep(RETRY_GAP_SEC)
+
+        # EC1 dan EC2 — panggilan 1 leg saja (tanpa bridge), hanya untuk pemberitahuan
+        for label, number in numbers[1:]:
             if not number:
                 continue
-
             if stop_event.is_set():
                 break
             while not pause_event.is_set():
@@ -345,34 +402,59 @@ def call_flow_worker():
             if stop_event.is_set():
                 break
 
-            # INFO: sedang menelepon nomor apa (event + broadcast)
-            payload_calling = make_progress_payload(item, f"CALLING {label}", number, None, "ringing")
-            publish_event({"type": "progress", "payload": payload_calling})
+            publish_event({"type": "progress",
+                           "payload": make_progress_payload(item, f"CALLING {label}", number, None, "ringing")})
 
-            # NASABAH -> transfer ke agent; EC1/EC2 -> tanpa transfer (bisa diubah)
-            agent = username if label == "NASABAH" else None
-            try:
-                result = sip.dial_then_transfer_to_agent(number, RING_TIMEOUT_SEC, agent_user=agent)
-            except Exception as e:
-                result = {"answered": False, "detail": f"error:{e}"}
-
-            print(f"[DIAL] {label} {number} -> answered={result['answered']} ({result['detail']})")
-
-            payload_done = make_progress_payload(item, label, number, result["answered"], result["detail"])
-            publish_event({"type": "progress", "payload": payload_done})
-
-            # Selesai jika:
-            if label == "NASABAH" and result["answered"]:
-                break       # ditransfer ke agent (Windows)
-            if label in ("EC1", "EC2") and result["answered"]:
-                break       # (opsional) berhenti jika EC menjawab
-
+            # panggil 1 leg saja (menunggu jawaban atau timeout), lalu tutup
+            ok = single_leg_call(number)
+            publish_event({"type": "progress",
+                           "payload": make_progress_payload(item, label, number, ok["answered"], ok["detail"])})
+            if ok["answered"]:
+                break
             time.sleep(RETRY_GAP_SEC)
 
         with state_lock:
             call_status["processed"] += 1
             call_status["in_progress"] = None
         call_queue.task_done()
+
+def single_leg_call(number: str):
+    """Panggilan 1 leg (untuk EC)."""
+    _register_pj_thread("single-leg")
+    if not sip.acc:
+        return {"answered": False, "detail": "no_account"}
+
+    uri = f"sip:{number}{SIP_DIAL_SUFFIX}"
+    ans = threading.Event()
+    disc = threading.Event()
+    cb = _CallCb(ans, disc)
+    call = sip.acc.make_call(uri, cb)
+    sip._track_call(call, True)
+
+    t0 = time.time()
+    answered = False
+    while time.time() - t0 < RING_TIMEOUT_SEC:
+        if stop_event.is_set():
+            try: call.hangup()
+            except: pass
+            sip._track_call(call, False)
+            return {"answered": False, "detail": "aborted"}
+        if ans.is_set():
+            answered = True
+            break
+        if disc.is_set():
+            break
+        time.sleep(DIAL_WAIT_STEP)
+
+    try:
+        call.hangup()
+    except Exception:
+        pass
+    sip._track_call(call, False)
+    if answered and disc.is_set():
+        # kalau langsung putus, tetap dianggap answered=True detail "disconnected"
+        return {"answered": True, "detail": "disconnected"}
+    return {"answered": answered, "detail": "answered" if answered else "timeout"}
 
 # Inisialisasi flags & jalankan worker
 pause_event.set()
@@ -462,10 +544,17 @@ def handle_action(action):
             call_status["running"] = False
             call_status["paused"] = False
             call_status["stopped"] = True
-        run_event.clear()      # hentikan eksekusi
+        run_event.clear()
         stop_event.set()
         pause_event.set()
 
+        # Putuskan SEMUA panggilan aktif SEKARANG
+        try:
+            sip.hangup_all()
+        except Exception:
+            pass
+
+        # kosongkan antrian
         drained = 0
         try:
             while True:

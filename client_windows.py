@@ -63,7 +63,7 @@ class ClientUI:
     def __init__(self, root):
         self.root = root
         self.root.title("📞 Client Info Call")
-        self.root.geometry("960x760")
+        self.root.geometry("980x820")
         self.root.configure(bg="#e9f5ee")
 
         style = ttk.Style()
@@ -122,6 +122,14 @@ class ClientUI:
         self.tree.tag_configure("oddrow", background="#f9f9f9")
         self.tree.tag_configure("evenrow", background="#ffffff")
 
+        # --- Section: Sedang Menelepon (kartu ringkas) ---
+        self.now_frame = ttk.Frame(self.root, style="Card.TFrame", padding=10)
+        self.now_frame.pack(fill="x", padx=12, pady=(0,10))
+        ttk.Label(self.now_frame, text="📞 Sedang Menelepon",
+                  font=("Segoe UI", 11, "bold"), background="white").pack(anchor="w")
+        self.now_info = ttk.Label(self.now_frame, text="-", justify="left", background="white")
+        self.now_info.pack(anchor="w", pady=5)
+
         # --- Tombol kontrol ---
         btn_frame = ttk.Frame(self.root, padding=10)
         btn_frame.pack(fill="x")
@@ -160,24 +168,32 @@ class ClientUI:
         )
 
         # refresh tabel
-        for i in self.tree.get_children():
-            self.tree.delete(i)
-        for idx, d in enumerate(data.get("data", [])):
-            tag = "evenrow" if idx % 2 == 0 else "oddrow"
-            self.tree.insert("", "end",
-                             values=(d.get('nama_nasabah',''), d.get('phone',''),
-                                     d.get('ec_name_1',''), d.get('ec_phone_1',''),
-                                     d.get('ec_name_2',''), d.get('ec_phone_2',''),
-                                     d.get('total_tagihan','')),
-                             tags=(tag,))
+        if isinstance(data.get("data"), list):
+            for i in self.tree.get_children():
+                self.tree.delete(i)
+            for idx, d in enumerate(data.get("data", [])):
+                tag = "evenrow" if idx % 2 == 0 else "oddrow"
+                self.tree.insert("", "end",
+                                 values=(d.get('nama_nasabah',''), d.get('phone',''),
+                                         d.get('ec_name_1',''), d.get('ec_phone_1',''),
+                                         d.get('ec_name_2',''), d.get('ec_phone_2',''),
+                                         d.get('total_tagihan','')),
+                                 tags=(tag,))
 
-        # LOG dari broadcast progress (jika sampai)
+        # Section "Sedang Menelepon" + Log
         progress = data.get("progress")
         if progress:
             phase = progress.get('phase', '-')
             number = progress.get('number', '-')
             answered = progress.get('answered')  # None saat CALLING
             detail = progress.get('detail', '')
+
+            # Update kartu "Sedang Menelepon"
+            current_text = f"Phase: {phase}\nNomor: {number}\nStatus: "
+            current_text += ("Memanggil..." if answered is None else f"answered={answered} ({detail})")
+            self.now_info.config(text=current_text)
+
+            # Log
             if answered is None:
                 msg = f"[CALL] {phase} -> {number} | (sedang menelepon…)\n"
             else:
@@ -200,6 +216,7 @@ class ClientUI:
 
                     number = "-"
                     if inprog:
+                        # ambil nomor utama yang sedang dipanggil
                         number = inprog.get("phone") or inprog.get("ec_phone_1") or inprog.get("ec_phone_2") or "-"
 
                     state = "Running" if running else "Stopped"
@@ -210,19 +227,22 @@ class ClientUI:
 
                     cur_key = json.dumps(inprog, sort_keys=True) if inprog else ""
                     if inprog and cur_key != last_inprog_key:
+                        self.now_info.config(text=f"Phase: Menyiapkan panggilan\nNomor: {number}\nStatus: -")
                         self.log_area.insert("end", f"[CALL] Sedang menelepon -> {number}\n")
                         self.log_area.see("end")
                         last_inprog_key = cur_key
+                else:
+                    self.status_var.set(f"Status: (server {r.status_code})")
             except Exception:
                 pass
-            time.sleep(2)
+            time.sleep(1.5)
 
     # ---------- Polling event stream (/events) ----------
     def poll_server_events(self):
         since = 0
         while True:
             try:
-                r = requests.get(f"{LINUX_SERVER}/events", params={"since": since}, timeout=5)
+                r = requests.get(f"{LINUX_SERVER}/events", params={"since": since}, timeout=6)
                 if r.status_code == 200:
                     data = r.json()
                     evs = data.get("events", [])
@@ -236,16 +256,25 @@ class ClientUI:
                                 number = prog.get("number", "-")
                                 answered = prog.get("answered")
                                 detail = prog.get("detail", "")
+
+                                # Update kartu "Sedang Menelepon"
+                                current_text = f"Phase: {phase}\nNomor: {number}\nStatus: "
+                                current_text += ("Memanggil..." if answered is None else f"answered={answered} ({detail})")
+                                self.now_info.config(text=current_text)
+
+                                # Log
                                 if answered is None:
                                     msg = f"[CALL] {phase} -> {number} | (sedang menelepon…)\n"
                                 else:
                                     msg = f"[CALL] {phase} -> {number} | answered={answered} ({detail})\n"
                                 self.log_area.insert("end", msg)
                                 self.log_area.see("end")
+
                             elif etype == "action":
                                 act = e.get("payload", {})
                                 self.log_area.insert("end", f"[ACTION] {act.get('action')} -> {act.get('message')}\n")
                                 self.log_area.see("end")
+
                             elif etype == "dataset":
                                 self.log_area.insert("end", "[INFO] Dataset diterima server.\n")
                                 self.log_area.see("end")
