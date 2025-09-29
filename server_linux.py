@@ -21,7 +21,7 @@ SIP_HOSTPORT = "ld.infin8link.com:7060"
 SIP_REG_URI = f"sip:{SIP_HOSTPORT}"
 SIP_DIAL_SUFFIX = f"@{SIP_HOSTPORT}"   # sip:<number>@ld.infin8link.com:7060
 
-# Waktu tunggu antar langkah bridge (detik)
+# Waktu tunggu step polling
 DIAL_WAIT_STEP = 0.1
 # ===========================================================
 
@@ -84,8 +84,9 @@ def publish_event(ev: dict, also_broadcast=True):
 
 def make_progress_payload(item, phase, number, answered, detail):
     return {
-        "user": {"id_system": "-", "username": "worker", "phone": "-"},
-        "data": [item],
+        # NOTE: payload progress TIDAK mengandung kredensial; biar Windows tidak overwrite Staff info
+        "user": {"username": "worker"},
+        "data": [],  # jangan bawa batch agar Windows tidak refresh tabel
         "progress": {
             "phase": phase,
             "number": number,
@@ -383,10 +384,8 @@ def call_flow_worker():
                     call_status["processed"] += 1
                     call_status["in_progress"] = None
                 call_queue.task_done()
-                # tunggu sampai stop atau sampai kedua leg putus? (Tidak perlu; bridge jalan di background)
                 continue
             else:
-                # jika tidak terjawab atau gagal bridge, lanjut ke EC1/EC2
                 time.sleep(RETRY_GAP_SEC)
 
         # EC1 dan EC2 — panggilan 1 leg saja (tanpa bridge), hanya untuk pemberitahuan
@@ -405,7 +404,6 @@ def call_flow_worker():
             publish_event({"type": "progress",
                            "payload": make_progress_payload(item, f"CALLING {label}", number, None, "ringing")})
 
-            # panggil 1 leg saja (menunggu jawaban atau timeout), lalu tutup
             ok = single_leg_call(number)
             publish_event({"type": "progress",
                            "payload": make_progress_payload(item, label, number, ok["answered"], ok["detail"])})
@@ -452,7 +450,6 @@ def single_leg_call(number: str):
         pass
     sip._track_call(call, False)
     if answered and disc.is_set():
-        # kalau langsung putus, tetap dianggap answered=True detail "disconnected"
         return {"answered": True, "detail": "disconnected"}
     return {"answered": answered, "detail": "answered" if answered else "timeout"}
 
@@ -548,22 +545,26 @@ def handle_action(action):
         stop_event.set()
         pause_event.set()
 
-        # Putuskan SEMUA panggilan aktif SEKARANG
-        try:
-            sip.hangup_all()
-        except Exception:
-            pass
+        # Putuskan SEMUA panggilan aktif & kosongkan antrian di thread terpisah
+        def _hard_stop():
+            try:
+                sip.hangup_all()
+            except Exception:
+                pass
+            drained = 0
+            try:
+                while True:
+                    call_queue.get_nowait()
+                    call_queue.task_done()
+                    drained += 1
+            except Exception:
+                pass
+            publish_event({"type": "action",
+                           "payload": {"action": "stop-drain", "message": f"Queue drained {drained} items"}},
+                          also_broadcast=False)
 
-        # kosongkan antrian
-        drained = 0
-        try:
-            while True:
-                call_queue.get_nowait()
-                call_queue.task_done()
-                drained += 1
-        except Exception:
-            pass
-        msg = f"Call dihentikan (queue dikosongkan {drained} item)"
+        threading.Thread(target=_hard_stop, daemon=True).start()
+        msg = "Call dihentikan (stop signal dikirim, queue dikosongkan di background)"
 
     else:
         msg = "Action tidak dikenal"
