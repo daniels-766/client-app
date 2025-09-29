@@ -17,9 +17,9 @@ CLIENT_PORT_DEFAULT = 6000
 
 # SIP server kamu (ganti jika perlu)
 SIP_DOMAIN = "ld.infin8link.com"
-SIP_HOSTPORT = "ld.infin8link.com:7060"
+SIP_HOSTPORT = "ld.infin8link.com:6070"
 SIP_REG_URI = f"sip:{SIP_HOSTPORT}"
-SIP_DIAL_SUFFIX = f"@{SIP_HOSTPORT}"   # sip:<number>@ld.infin8link.com:7060
+SIP_DIAL_SUFFIX = f"@{SIP_HOSTPORT}"   # sip:<number>@ld.infin8link.com:6070
 
 # Waktu tunggu step polling
 DIAL_WAIT_STEP = 0.1
@@ -84,7 +84,7 @@ def publish_event(ev: dict, also_broadcast=True):
 
 def make_progress_payload(item, phase, number, answered, detail):
     return {
-        # NOTE: payload progress TIDAK mengandung kredensial; biar Windows tidak overwrite Staff info
+        # NOTE: payload progress TIDAK mengandung kredensial; biar Windows tidak overwrite Staff/Data
         "user": {"username": "worker"},
         "data": [],  # jangan bawa batch agar Windows tidak refresh tabel
         "progress": {
@@ -170,30 +170,42 @@ class SipManager:
         _register_pj_thread("ensure-account")
 
         with self.lock:
-            if self.acc and self.acc_user == username and self.acc_pass == password:
-                return
-            self._destroy_acc()
-            cfg = pj.AccountConfig()
-            cfg.id = f"sip:{username}@{SIP_DOMAIN}"
-            cfg.reg_uri = SIP_REG_URI
-            # Penting: gunakan argumen POSISI (realm, username, passwd)
-            cfg.auth_cred = [pj.AuthCred("*", username, password)]
-            # Jika perlu paksa UDP:
-            # cfg.proxy = [f"sip:{SIP_HOSTPORT};transport=udp"]
+            # reset akun beda kredensial
+            if not (self.acc and self.acc_user == username and self.acc_pass == password):
+                self._destroy_acc()
+                cfg = pj.AccountConfig()
+                cfg.id = f"sip:{username}@{SIP_DOMAIN}"
+                cfg.reg_uri = SIP_REG_URI
+                # POSISIONAL (realm, username, password)
+                cfg.auth_cred = [pj.AuthCred("*", username, password)]
+                # >>> Paksa TRANSPORT UDP (sering wajib)
+                cfg.proxy = [f"sip:{SIP_HOSTPORT};transport=udp"]
+                # <<<
+                self.acc = self.lib.create_account(cfg)
+                self.acc_user = username
+                self.acc_pass = password
 
-            self.acc = self.lib.create_account(cfg)
-            self.acc_user = username
-            self.acc_pass = password
+        # TUNGGU REGISTER (8 detik) + publish event agar terlihat di Windows
+        t0 = time.time()
+        reg_ok = False
+        last_code = 0
+        while time.time() - t0 < 8.0:
+            info = self.acc.info()
+            last_code = info.reg_status
+            if last_code == 200:
+                reg_ok = True
+                break
+            time.sleep(0.2)
 
-            # Tunggu register (maks 5 detik)
-            t0 = time.time()
-            while time.time() - t0 < 5:
-                info = self.acc.info()
-                if info.reg_status == 200:
-                    print(f"[PJSIP] Registered as {username}")
-                    return
-                time.sleep(0.2)
-            print(f"[PJSIP] Register pending/failed: {self.acc.info().reg_status}")
+        detail = "registered" if reg_ok else f"register_status:{last_code}"
+        publish_event({"type": "progress",
+                       "payload": {
+                           "user": {"username": "worker"},
+                           "data": [],
+                           "progress": {"phase": "REGISTER", "number": "-", "answered": reg_ok, "detail": detail}
+                       }})
+        if not reg_ok:
+            raise RuntimeError(f"register_failed:{last_code}")
 
     def _track_call(self, call, add=True):
         with self.active_lock:
@@ -347,7 +359,11 @@ def call_flow_worker():
                 call_status["in_progress"] = None
             continue
 
-        # Login SIP
+        # LOGIN (event)
+        publish_event({"type": "progress",
+                       "payload": make_progress_payload(item, "LOGIN", "-", None, "authenticating")})
+
+        # Login SIP (REGISTER)
         try:
             sip.ensure_account(username, password)
         except Exception as e:
@@ -376,7 +392,8 @@ def call_flow_worker():
                                                 ring_timeout_sec=RING_TIMEOUT_SEC)
             answered = result.get("ok", False)
             detail = result.get("reason", "")
-            publish_event({"type": "progress", "payload": make_progress_payload(item, label, number, answered, detail)})
+            publish_event({"type": "progress",
+                           "payload": make_progress_payload(item, label, number, answered, detail)})
 
             # Jika bridged berhasil, akhiri proses item ini (agent ngobrol dengan nasabah)
             if answered:
@@ -547,6 +564,8 @@ def handle_action(action):
 
         # Putuskan SEMUA panggilan aktif & kosongkan antrian di thread terpisah
         def _hard_stop():
+            # FIX: register PJ thread sebelum pakai fungsi PJSIP
+            _register_pj_thread("hard-stop")
             try:
                 sip.hangup_all()
             except Exception:
@@ -560,7 +579,8 @@ def handle_action(action):
             except Exception:
                 pass
             publish_event({"type": "action",
-                           "payload": {"action": "stop-drain", "message": f"Queue drained {drained} items"}},
+                           "payload": {"action": "stop-drain",
+                                       "message": f"Queue drained {drained} items"}},
                           also_broadcast=False)
 
         threading.Thread(target=_hard_stop, daemon=True).start()
@@ -603,6 +623,8 @@ if __name__ == "__main__":
         app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
     finally:
         try:
-            sip.destroy()
+            # Tidak mematikan Flask; hanya bersihkan PJSIP saat proses keluar
+            if pj.Lib.instance() is not None:
+                pj.Lib.instance().destroy()
         except Exception:
             pass
