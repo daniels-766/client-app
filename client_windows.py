@@ -29,8 +29,7 @@ def get_local_ip():
 @flask_app.route("/receive-info", methods=["POST"])
 def receive_info():
     data = request.json
-
-    # Jika datang dari dashboard, forward ke Linux (sekali saja, cegah loop)
+    # Jika datang dari dashboard, forward ke Linux (sekali saja)
     if data and data.get("origin") == "dashboard" and not data.get("server_forwarded"):
         try:
             fwd = dict(data)
@@ -51,7 +50,7 @@ class ClientUI:
     def __init__(self, root):
         self.root = root
         self.root.title("📞 Client Info Call")
-        self.root.geometry("940x720")
+        self.root.geometry("960x760")
         self.root.configure(bg="#e9f5ee")
 
         style = ttk.Style()
@@ -68,18 +67,15 @@ class ClientUI:
         # --- Kartu User ---
         self.user_frame = ttk.Frame(self.root, style="Card.TFrame", padding=10)
         self.user_frame.pack(fill="x", padx=12, pady=10)
-
         self.user_label = ttk.Label(self.user_frame, text="👤 Staff Information",
                                     font=("Segoe UI", 11, "bold"), background="white")
         self.user_label.pack(anchor="w")
-
         self.user_info = ttk.Label(self.user_frame, text="", justify="left", background="white")
         self.user_info.pack(anchor="w", pady=5)
 
         # --- Tabel Data Nasabah ---
         self.data_frame = ttk.Frame(self.root, style="Card.TFrame", padding=10)
         self.data_frame.pack(fill="both", expand=True, padx=12, pady=10)
-
         self.data_label = ttk.Label(self.data_frame, text="📊 DATA NASABAH",
                                     font=("Segoe UI", 11, "bold"), background="white")
         self.data_label.pack(anchor="w")
@@ -129,19 +125,21 @@ class ClientUI:
         self.log_label = ttk.Label(log_frame, text="📝 Monitoring Log",
                                    font=("Segoe UI", 11, "bold"), background="white")
         self.log_label.pack(anchor="w")
-        self.log_area = scrolledtext.ScrolledText(log_frame, height=10, wrap="word",
+        self.log_area = scrolledtext.ScrolledText(log_frame, height=12, wrap="word",
                                                   font=("Consolas", 10), background="black", foreground="lime")
         self.log_area.pack(fill="both", expand=True, pady=5)
 
-        # --- Status bar (live polling /api/log) ---
+        # --- Status bar (poll /api/log) ---
         self.status_var = tk.StringVar(value="Status: -")
         self.status_label = ttk.Label(self.root, textvariable=self.status_var)
         self.status_label.pack(fill="x", padx=12, pady=(0,8))
 
+        # Workers
         threading.Thread(target=self.register_to_server, daemon=True).start()
         threading.Thread(target=self.poll_server_status, daemon=True).start()
+        threading.Thread(target=self.poll_server_events, daemon=True).start()
 
-    # ---------- Tampilkan data + progress ke UI ----------
+    # ---------- Tampilkan data + progress (broadcast) ----------
     def show_data(self, data):
         user = data.get("user", {})
         self.user_info.config(
@@ -160,7 +158,7 @@ class ClientUI:
                                      d.get('total_tagihan','')),
                              tags=(tag,))
 
-        # LOG: event broadcast dari server (CALLING / hasil)
+        # LOG dari broadcast progress (jika sampai)
         progress = data.get("progress")
         if progress:
             phase = progress.get('phase', '-')
@@ -181,13 +179,12 @@ class ClientUI:
             try:
                 r = requests.get(f"{LINUX_SERVER}/api/log", timeout=4)
                 if r.status_code == 200:
-                    st = r.json()  # {running, paused, in_progress, queue_size, ...}
+                    st = r.json()
                     running = st.get("running")
                     paused  = st.get("paused")
                     qsize   = st.get("queue_size", 0)
                     inprog  = st.get("in_progress") or {}
 
-                    # Tentukan nomor yang sedang ditelepon untuk status bar
                     number = "-"
                     if inprog:
                         number = inprog.get("phone") or inprog.get("ec_phone_1") or inprog.get("ec_phone_2") or "-"
@@ -198,7 +195,6 @@ class ClientUI:
 
                     self.status_var.set(f"Status: {state} | Queue: {qsize} | DIALING: {number}")
 
-                    # Tulis sekali ke log jika target berubah
                     cur_key = json.dumps(inprog, sort_keys=True) if inprog else ""
                     if inprog and cur_key != last_inprog_key:
                         self.log_area.insert("end", f"[CALL] Sedang menelepon -> {number}\n")
@@ -207,6 +203,46 @@ class ClientUI:
             except Exception:
                 pass
             time.sleep(2)
+
+    # ---------- Polling event stream (/events) ----------
+    def poll_server_events(self):
+        since = 0
+        while True:
+            try:
+                r = requests.get(f"{LINUX_SERVER}/events", params={"since": since}, timeout=5)
+                if r.status_code == 200:
+                    data = r.json()
+                    evs = data.get("events", [])
+                    if evs:
+                        for e in evs:
+                            etype = e.get("type")
+                            if etype == "progress":
+                                payload = e.get("payload", {})
+                                prog = payload.get("progress", {})
+                                phase = prog.get("phase", "-")
+                                number = prog.get("number", "-")
+                                answered = prog.get("answered")
+                                detail = prog.get("detail", "")
+                                if answered is None:
+                                    msg = f"[CALL] {phase} -> {number} | (sedang menelepon…)\n"
+                                else:
+                                    msg = f"[CALL] {phase} -> {number} | answered={answered} ({detail})\n"
+                                self.log_area.insert("end", msg)
+                                self.log_area.see("end")
+                            elif etype == "action":
+                                act = e.get("payload", {})
+                                self.log_area.insert("end", f"[ACTION] {act.get('action')} -> {act.get('message')}\n")
+                                self.log_area.see("end")
+                            elif etype == "dataset":
+                                # optional: tampilkan info dataset masuk
+                                self.log_area.insert("end", "[INFO] Dataset diterima server.\n")
+                                self.log_area.see("end")
+                        since = max(since, max(ev["event_id"] for ev in evs))
+                    else:
+                        since = data.get("last_id", since)
+            except Exception:
+                pass
+            time.sleep(0.8)
 
     # ---------- Kirim perintah ke Server Linux ----------
     def send_command(self, action):

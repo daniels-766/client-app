@@ -2,7 +2,8 @@
 import threading
 import time
 from queue import Queue
-from flask import Flask, request, jsonify
+from collections import deque
+from flask import Flask, request, jsonify, request as flask_request
 import requests
 
 # ==== PJSIP (pjsua) ====
@@ -17,13 +18,13 @@ CLIENT_PORT_DEFAULT = 6000
 SIP_DOMAIN = "ld.infin8link.com"
 SIP_HOSTPORT = "ld.infin8link.com:7060"
 SIP_REG_URI = f"sip:{SIP_HOSTPORT}"
-SIP_DIAL_SUFFIX = f"@{SIP_HOSTPORT}"   # hasil: sip:<number>@ld.infin8link.com:7060
+SIP_DIAL_SUFFIX = f"@{SIP_HOSTPORT}"   # sip:<number>@ld.infin8link.com:7060
 # ===========================================================
 
 app = Flask(__name__)
 
 # ======= State global =======
-connected_clients = set()    # misal: "http://192.168.88.201:6000"
+connected_clients = set()    # contoh: "http://192.168.88.201:6000"
 call_queue = Queue()
 state_lock = threading.Lock()
 
@@ -31,7 +32,7 @@ call_status = {
     "running": False,
     "paused": False,
     "stopped": False,
-    "in_progress": None,   # dict info item berjalan (nama, phone, ec_phone_1, ec_phone_2, dll)
+    "in_progress": None,   # dict info item berjalan
     "processed": 0,
     "queued": 0,
     "active_sip_user": None
@@ -39,6 +40,28 @@ call_status = {
 
 pause_event = threading.Event()  # set() -> jalan; clear() -> pause
 stop_event  = threading.Event()  # set() -> stop
+
+# ======= Event Bus (untuk realtime polling dari Windows) =======
+EVENT_MAX = 2000
+events_buf = deque(maxlen=EVENT_MAX)  # simpan dict event
+event_lock = threading.Lock()
+event_seq = 0
+
+def publish_event(ev: dict, also_broadcast=True):
+    """Simpan event ke buffer + optional broadcast ke Windows."""
+    global event_seq
+    with event_lock:
+        event_seq += 1
+        ev_out = dict(ev)
+        ev_out["event_id"] = event_seq
+        ev_out["ts"] = time.time()
+        events_buf.append(ev_out)
+    if also_broadcast:
+        try:
+            broadcast_to_clients("/receive-info", ev.get("payload", ev))
+        except Exception:
+            pass
+    return ev_out
 
 # ===========================================================
 #                 PJSIP: Library & Account
@@ -81,7 +104,7 @@ class SipManager:
 
     def _init_lib(self):
         self.lib = pj.Lib()
-        self.lib.init(log_cfg=pj.LogConfig(level=3, callback=_log_cb))
+        self.lib.init(log_cfg=pj.LogConfig(level=2, callback=_log_cb))
         # transport UDP & TCP
         self.lib.create_transport(pj.TransportType.UDP, pj.TransportConfig(0))
         self.lib.create_transport(pj.TransportType.TCP, pj.TransportConfig(0))
@@ -184,18 +207,30 @@ class SipManager:
 sip = SipManager()
 
 # ===========================================================
-#                 Broadcast util ke Windows
+#            Broadcast util + helper format event
 # ===========================================================
 def broadcast_to_clients(path, payload):
     dead = []
     for base in list(connected_clients):
         url = f"{base}{path}"
         try:
-            requests.post(url, json=payload, timeout=3)
+            requests.post(url, json=payload, timeout=2.5)
         except Exception:
             dead.append(base)
     for d in dead:
         connected_clients.discard(d)
+
+def make_progress_payload(item, phase, number, answered, detail):
+    return {
+        "user": {"id_system": "-", "username": "worker", "phone": "-"},
+        "data": [item],
+        "progress": {
+            "phase": phase,
+            "number": number,
+            "answered": answered,
+            "detail": detail
+        }
+    }
 
 # ===========================================================
 #                     Worker antrian
@@ -236,14 +271,8 @@ def call_flow_worker():
         try:
             sip.ensure_account(username, password)
         except Exception as e:
-            try:
-                broadcast_to_clients("/receive-info", {
-                    "user": {"id_system": "-", "username": "worker", "phone": "-"},
-                    "data": [item],
-                    "progress": {"phase": "LOGIN", "number": "-", "answered": False, "detail": f"login_failed:{e}"}
-                })
-            except Exception:
-                pass
+            payload = make_progress_payload(item, "LOGIN", "-", False, f"login_failed:{e}")
+            publish_event({"type": "progress", "payload": payload})
             with state_lock:
                 call_status["processed"] += 1
                 call_status["in_progress"] = None
@@ -269,17 +298,11 @@ def call_flow_worker():
             if stop_event.is_set():
                 break
 
-            # INFO: sedang menelepon nomor apa
-            try:
-                broadcast_to_clients("/receive-info", {
-                    "user": {"id_system": "-", "username": "worker", "phone": "-"},
-                    "data": [item],
-                    "progress": {"phase": f"CALLING {label}", "number": number, "answered": None, "detail": "ringing"}
-                })
-            except Exception:
-                pass
+            # INFO: sedang menelepon nomor apa (event + broadcast)
+            payload_calling = make_progress_payload(item, f"CALLING {label}", number, None, "ringing")
+            publish_event({"type": "progress", "payload": payload_calling})
 
-            # NASABAH -> transfer ke agent; EC1/EC2 -> tanpa transfer (bisa diubah sesuai kebutuhan)
+            # NASABAH -> transfer ke agent; EC1/EC2 -> tanpa transfer (bisa diubah)
             agent = username if label == "NASABAH" else None
             try:
                 result = sip.dial_then_transfer_to_agent(number, RING_TIMEOUT_SEC, agent_user=agent)
@@ -288,23 +311,12 @@ def call_flow_worker():
 
             print(f"[DIAL] {label} {number} -> answered={result['answered']} ({result['detail']})")
 
-            try:
-                broadcast_to_clients("/receive-info", {
-                    "user": {"id_system": "-", "username": "worker", "phone": "-"},
-                    "data": [item],
-                    "progress": {
-                        "phase": label,
-                        "number": number,
-                        "answered": result["answered"],
-                        "detail": result["detail"]
-                    }
-                })
-            except Exception:
-                pass
+            payload_done = make_progress_payload(item, label, number, result["answered"], result["detail"])
+            publish_event({"type": "progress", "payload": payload_done})
 
             # Selesai jika:
             if label == "NASABAH" and result["answered"]:
-                break       # sudah ditransfer ke agent (Windows)
+                break       # ditransfer ke agent (Windows)
             if label in ("EC1", "EC2") and result["answered"]:
                 break       # (opsional) berhenti jika EC menjawab
 
@@ -326,7 +338,7 @@ worker_thread.start()
 # ===========================================================
 @app.route("/register-client", methods=["POST"])
 def register_client():
-    data = request.json or {}
+    data = flask_request.json or {}
     ip = data.get("ip")
     port = data.get("port", CLIENT_PORT_DEFAULT)
     if not ip:
@@ -339,7 +351,7 @@ def register_client():
 # body: { "user": {"num_sip":"", "pas_sip":""}, "data":[{...}, ...] }
 @app.route("/push-data", methods=["POST"])
 def push_data():
-    payload = request.json or {}
+    payload = flask_request.json or {}
     dataset = payload.get("data", [])
     u = payload.get("user", {}) or {}
     sip_user = u.get("num_sip")
@@ -351,10 +363,7 @@ def push_data():
         return jsonify({"status": "error", "message": "num_sip/pas_sip kosong"}), 400
 
     # broadcast tabel awal (opsional)
-    try:
-        broadcast_to_clients("/receive-info", payload)
-    except Exception as e:
-        print(f"[WARN] broadcast awal gagal: {e}")
+    publish_event({"type": "dataset", "payload": payload})  # juga broadcast
 
     added = 0
     for row in dataset:
@@ -425,6 +434,7 @@ def handle_action(action):
         code = 400
 
     print(f"[ACTION] {action.upper()} -> {msg}")
+    publish_event({"type": "action", "payload": {"action": action, "message": msg}}, also_broadcast=False)
     return jsonify({"status": "ok" if code == 200 else "error", "action": action, "message": msg}), code
 
 @app.route("/api/log", methods=["GET"])
@@ -433,6 +443,22 @@ def get_status():
         s = dict(call_status)
         s["queue_size"] = call_queue.qsize()
     return jsonify(s), 200
+
+@app.route("/events", methods=["GET"])
+def get_events():
+    """
+    Polling incremental:
+      GET /events?since=<event_id_terakhir_yang_sudah_diproses>
+    Return: { "events":[...], "last_id": <id_terakhir> }
+    """
+    try:
+        since = int(flask_request.args.get("since", "0"))
+    except Exception:
+        since = 0
+    with event_lock:
+        out = [e for e in events_buf if e["event_id"] > since]
+        last_id = events_buf[-1]["event_id"] if events_buf else since
+    return jsonify({"events": out, "last_id": last_id})
 
 # ======= Main =======
 if __name__ == "__main__":
