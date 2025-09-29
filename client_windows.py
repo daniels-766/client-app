@@ -28,17 +28,22 @@ def get_local_ip():
 
 @flask_app.route("/receive-info", methods=["POST"])
 def receive_info():
-    data = request.json
-    # Jika datang dari dashboard, forward ke Linux (sekali saja)
-    if data and data.get("origin") == "dashboard" and not data.get("server_forwarded"):
+    data = request.json or {}
+
+    # SELALU forward ke Linux jika payload batch (user+data) dan belum diforward
+    if data.get("user") and data.get("data") and not data.get("server_forwarded"):
         try:
             fwd = dict(data)
             fwd["server_forwarded"] = True
-            requests.post(f"{LINUX_SERVER}/push-data", json=fwd, timeout=10)
+            res = requests.post(f"{LINUX_SERVER}/push-data", json=fwd, timeout=10)
+            # log sukses/gagal supaya kelihatan jelas di Monitoring Log
+            msg = f"[FORWARD] /push-data -> {res.status_code} {res.text[:200]}\n"
         except Exception as e:
-            print("[FORWARD ERROR]", e)
+            msg = f"[FORWARD ERROR] {e}\n"
+        if client_ui:
+            client_ui.log_area.insert("end", msg)
+            client_ui.log_area.see("end")
 
-    print("📩 Data diterima di Windows:", data)
     if client_ui:
         client_ui.show_data(data)
     return jsonify({"status": "ok", "message": "Data diterima client"}), 200

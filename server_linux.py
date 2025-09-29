@@ -131,7 +131,7 @@ class SipManager:
             cfg = pj.AccountConfig()
             cfg.id = f"sip:{username}@{SIP_DOMAIN}"
             cfg.reg_uri = SIP_REG_URI
-            cfg.auth_cred = [pj.AuthCred(realm="*", username=username, data=password)]
+            cfg.auth_cred = [pj.AuthCred("*", username, password)]
             # Paksa UDP? uncomment:
             # cfg.proxy = [f"sip:{SIP_HOSTPORT};transport=udp"]
             self.acc = self.lib.create_account(cfg)
