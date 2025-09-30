@@ -63,8 +63,12 @@ class ClientUI:
     def __init__(self, root):
         self.root = root
         self.root.title("📞 Client Info Call")
-        self.root.geometry("960x760")
+        self.root.geometry("980x860")
         self.root.configure(bg="#e9f5ee")
+
+        # cache untuk staff info & dataset utama dari dashboard
+        self.staff_user = {}
+        self.data_list = []
 
         style = ttk.Style()
         style.theme_use("clam")
@@ -83,7 +87,7 @@ class ClientUI:
         self.user_label = ttk.Label(self.user_frame, text="👤 Staff Information",
                                     font=("Segoe UI", 11, "bold"), background="white")
         self.user_label.pack(anchor="w")
-        self.user_info = ttk.Label(self.user_frame, text="", justify="left", background="white")
+        self.user_info = ttk.Label(self.user_frame, text="-", justify="left", background="white")
         self.user_info.pack(anchor="w", pady=5)
 
         # --- Tabel Data Nasabah ---
@@ -99,9 +103,9 @@ class ClientUI:
         self.tree = ttk.Treeview(tree_frame,
                                  columns=("nama", "phone", "ec_name_1", "ec_phone_1",
                                           "ec_name_2", "ec_phone_2", "tagihan"),
-                                 show="headings", height=10)
-        for col, text in zip(self.tree["columns"], ["Nama Nasabah","Phone","Nama EC 1","Phone EC 1",
-                                                    "Nama EC 2","Phone EC 2","Total Tagihan"]):
+                                 show="headings", height=11)
+        for col, text in zip(self.tree["columns"],
+                             ["Nama Nasabah","Phone","Nama EC 1","Phone EC 1","Nama EC 2","Phone EC 2","Total Tagihan"]):
             self.tree.heading(col, text=text)
         self.tree.column("nama", width=200, anchor="w")
         self.tree.column("phone", width=150, anchor="center")
@@ -122,6 +126,14 @@ class ClientUI:
         self.tree.tag_configure("oddrow", background="#f9f9f9")
         self.tree.tag_configure("evenrow", background="#ffffff")
 
+        # --- Section: Sedang Menelepon (kartu ringkas) ---
+        self.now_frame = ttk.Frame(self.root, style="Card.TFrame", padding=10)
+        self.now_frame.pack(fill="x", padx=12, pady=(0,10))
+        ttk.Label(self.now_frame, text="📞 Sedang Menelepon",
+                  font=("Segoe UI", 11, "bold"), background="white").pack(anchor="w")
+        self.now_info = ttk.Label(self.now_frame, text="-", justify="left", background="white")
+        self.now_info.pack(anchor="w", pady=5)
+
         # --- Tombol kontrol ---
         btn_frame = ttk.Frame(self.root, padding=10)
         btn_frame.pack(fill="x")
@@ -138,7 +150,7 @@ class ClientUI:
         self.log_label = ttk.Label(log_frame, text="📝 Monitoring Log",
                                    font=("Segoe UI", 11, "bold"), background="white")
         self.log_label.pack(anchor="w")
-        self.log_area = scrolledtext.ScrolledText(log_frame, height=12, wrap="word",
+        self.log_area = scrolledtext.ScrolledText(log_frame, height=10, wrap="word",
                                                   font=("Consolas", 10), background="black", foreground="lime")
         self.log_area.pack(fill="both", expand=True, pady=5)
 
@@ -152,17 +164,22 @@ class ClientUI:
         threading.Thread(target=self.poll_server_status, daemon=True).start()
         threading.Thread(target=self.poll_server_events, daemon=True).start()
 
-    # ---------- Tampilkan data + progress (broadcast) ----------
-    def show_data(self, data):
-        user = data.get("user", {})
-        self.user_info.config(
-            text=f"ID: {user.get('id_system')}\nUsername: {user.get('username')}\nPhone: {user.get('phone')}"
+    # ---------- helper UI ----------
+    def _refresh_user_card(self):
+        u = self.staff_user or {}
+        text = (
+            f"ID: {u.get('id_system','-')}\n"
+            f"Username: {u.get('username','-')}\n"
+            f"Phone: {u.get('phone','-')}\n"
+            f"Email: {u.get('email','-')}\n"
+            f"SIP: {u.get('num_sip','-')}"
         )
+        self.user_info.config(text=text)
 
-        # refresh tabel
+    def _refresh_table(self):
         for i in self.tree.get_children():
             self.tree.delete(i)
-        for idx, d in enumerate(data.get("data", [])):
+        for idx, d in enumerate(self.data_list):
             tag = "evenrow" if idx % 2 == 0 else "oddrow"
             self.tree.insert("", "end",
                              values=(d.get('nama_nasabah',''), d.get('phone',''),
@@ -171,13 +188,38 @@ class ClientUI:
                                      d.get('total_tagihan','')),
                              tags=(tag,))
 
-        # LOG dari broadcast progress (jika sampai)
+    # ---------- Tampilkan data + progress ----------
+    def show_data(self, data):
+        # Jika datang batch asli dari dashboard (ada data list & kredensial),
+        # simpan ke cache dan refresh UI utama. EVENT progress dari server tidak memodifikasi ini.
+        if isinstance(data.get("data"), list) and data.get("data"):
+            user = data.get("user") or {}
+            if user.get("num_sip") and user.get("pas_sip"):
+                self.staff_user = {
+                    "id_system": user.get("id_system"),
+                    "username": user.get("username"),
+                    "phone": user.get("phone"),
+                    "email": user.get("email"),
+                    "num_sip": user.get("num_sip"),
+                }
+                self.data_list = list(data["data"])
+                self._refresh_user_card()
+                self._refresh_table()
+
+        # Section "Sedang Menelepon" + Log dari progress
         progress = data.get("progress")
         if progress:
             phase = progress.get('phase', '-')
             number = progress.get('number', '-')
             answered = progress.get('answered')  # None saat CALLING
             detail = progress.get('detail', '')
+
+            # Update kartu "Sedang Menelepon" (tidak memodifikasi Staff/Data Nasabah)
+            current_text = f"Phase: {phase}\nNomor: {number}\nStatus: "
+            current_text += ("Memanggil..." if answered is None else f"answered={answered} ({detail})")
+            self.now_info.config(text=current_text)
+
+            # Log
             if answered is None:
                 msg = f"[CALL] {phase} -> {number} | (sedang menelepon…)\n"
             else:
@@ -210,19 +252,23 @@ class ClientUI:
 
                     cur_key = json.dumps(inprog, sort_keys=True) if inprog else ""
                     if inprog and cur_key != last_inprog_key:
+                        # Jangan ubah tabel dan staff info di sini
+                        self.now_info.config(text=f"Phase: Menyiapkan panggilan\nNomor: {number}\nStatus: -")
                         self.log_area.insert("end", f"[CALL] Sedang menelepon -> {number}\n")
                         self.log_area.see("end")
                         last_inprog_key = cur_key
+                else:
+                    self.status_var.set(f"Status: (server {r.status_code})")
             except Exception:
                 pass
-            time.sleep(2)
+            time.sleep(1.5)
 
     # ---------- Polling event stream (/events) ----------
     def poll_server_events(self):
         since = 0
         while True:
             try:
-                r = requests.get(f"{LINUX_SERVER}/events", params={"since": since}, timeout=5)
+                r = requests.get(f"{LINUX_SERVER}/events", params={"since": since}, timeout=6)
                 if r.status_code == 200:
                     data = r.json()
                     evs = data.get("events", [])
@@ -236,17 +282,40 @@ class ClientUI:
                                 number = prog.get("number", "-")
                                 answered = prog.get("answered")
                                 detail = prog.get("detail", "")
+
+                                # Update kartu "Sedang Menelepon"
+                                current_text = f"Phase: {phase}\nNomor: {number}\nStatus: "
+                                current_text += ("Memanggil..." if answered is None else f"answered={answered} ({detail})")
+                                self.now_info.config(text=current_text)
+
+                                # Log
                                 if answered is None:
                                     msg = f"[CALL] {phase} -> {number} | (sedang menelepon…)\n"
                                 else:
                                     msg = f"[CALL] {phase} -> {number} | answered={answered} ({detail})\n"
                                 self.log_area.insert("end", msg)
                                 self.log_area.see("end")
+
                             elif etype == "action":
                                 act = e.get("payload", {})
                                 self.log_area.insert("end", f"[ACTION] {act.get('action')} -> {act.get('message')}\n")
                                 self.log_area.see("end")
+
                             elif etype == "dataset":
+                                # Hanya jika dataset dari dashboard (punya kredensial), refresh tabel + staff.
+                                payload = e.get("payload", {})
+                                usr = payload.get("user") or {}
+                                if usr.get("num_sip") and usr.get("pas_sip"):
+                                    self.staff_user = {
+                                        "id_system": usr.get("id_system"),
+                                        "username": usr.get("username"),
+                                        "phone": usr.get("phone"),
+                                        "email": usr.get("email"),
+                                        "num_sip": usr.get("num_sip"),
+                                    }
+                                    self.data_list = list(payload.get("data") or [])
+                                    self._refresh_user_card()
+                                    self._refresh_table()
                                 self.log_area.insert("end", "[INFO] Dataset diterima server.\n")
                                 self.log_area.see("end")
                         since = max(since, max(ev["event_id"] for ev in evs))
@@ -293,4 +362,5 @@ if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
     root = tk.Tk()
     client_ui = ClientUI(root)
+    client_ui.user_info.config(text="-")
     root.mainloop()
